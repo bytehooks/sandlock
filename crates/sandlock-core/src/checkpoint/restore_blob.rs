@@ -353,47 +353,83 @@ fn to_child_path(
     }
 }
 
+/// The kernel's restart sentinels for an aborted restartable syscall:
+/// -ERESTARTSYS / -ERESTARTNOINTR / -ERESTARTNOHAND / -ERESTART_RESTARTBLOCK.
+/// -515 (ENOIOCTLCMD) is NOT a restart code and must not be matched.
+#[cfg_attr(
+    not(any(target_arch = "x86_64", target_arch = "riscv64")),
+    allow(dead_code)
+)]
+fn is_restart_sentinel(v: i64) -> bool {
+    matches!(v, -512 | -513 | -514 | -516)
+}
+
+/// Return the restart sentinel a riscv64 register file holds in `a0`, if any.
+///
+/// On riscv64 `a0` is both the first syscall argument and the return value, so
+/// an aborted restartable syscall overwrites the original argument with the
+/// sentinel. The original (`orig_a0`) is not part of the ptrace-exposed
+/// `user_regs_struct`, so neither capture nor restore can recover it. Callers
+/// reject the checkpoint rather than resume with a corrupt return value.
+#[cfg(target_arch = "riscv64")]
+pub(crate) fn restart_sentinel_in_a0(regs: &[u64]) -> Option<i64> {
+    // riscv64 user_regs_struct order: pc, ra, sp, gp, tp, t0-t2, s0-s1,
+    // a0-a7, s2-s11, t3-t6 — so a0 is index 10.
+    const A0: usize = 10;
+    let a0 = *regs.get(A0)? as i64;
+    if is_restart_sentinel(a0) { Some(a0) } else { None }
+}
+
 /// Re-arm an interrupted, restartable syscall in the saved register file.
 ///
 /// When the checkpoint was taken (via `PTRACE_INTERRUPT`) while the process sat
 /// in a syscall, the kernel aborted it with a restart sentinel in the return
-/// register (-ERESTARTSYS / -ERESTARTNOINTR / -ERESTARTNOHAND /
-/// -ERESTART_RESTARTBLOCK). At the ptrace stop, the PC still points just PAST
-/// the syscall instruction. The kernel's restart fixup (rewind PC, reload return
-/// register with the original syscall number) normally runs on the syscall-return
-/// path, which a restore bypasses. Without it, userspace resumes one instruction
-/// past the syscall with the raw sentinel (e.g. -514) in the return register and
-/// faults. Applying the fixup here re-executes the syscall cleanly with its
-/// arguments still in registers (this is what CRIU does).
+/// register. At the ptrace stop the PC still points just PAST the syscall
+/// instruction. The kernel's restart fixup (rewind PC, reload the return
+/// register with the original syscall number) normally runs on the
+/// syscall-return path, which a restore bypasses. Without it, userspace resumes
+/// one instruction past the syscall with the raw sentinel (e.g. -514) in the
+/// return register and faults. Applying the fixup here re-executes the syscall
+/// cleanly with its arguments still in registers (this is what CRIU does).
 ///
-/// -515 (ENOIOCTLCMD) is NOT a restart code and must not be matched. For
-/// ERESTART_RESTARTBLOCK (-516) the original syscall is re-run rather than the
-/// kernel's `restart_syscall` path (restart_block is not captured), so
+/// For ERESTART_RESTARTBLOCK (-516) the original syscall is re-run rather than
+/// the kernel's `restart_syscall` path (restart_block is not captured), so
 /// timeout-bearing syscalls restart with their full original timeout: an
 /// accepted approximation for fresh-process restore.
 #[cfg(target_arch = "x86_64")]
-fn rearm_restartable_syscall(regs: &mut [u64]) {
+fn rearm_restartable_syscall(regs: &mut [u64]) -> Result<(), String> {
     // x86_64 user_regs_struct layout indices.
     const RAX: usize = 10;
     const ORIG_RAX: usize = 15;
     const RIP: usize = 16;
     if let (Some(&rax), Some(&orig_rax)) = (regs.get(RAX), regs.get(ORIG_RAX)) {
-        if matches!(rax as i64, -512 | -513 | -514 | -516) {
+        if is_restart_sentinel(rax as i64) {
             regs[RAX] = orig_rax;
             regs[RIP] = regs[RIP].wrapping_sub(2);
         }
     }
+    Ok(())
 }
 
-// riscv64 rearm is not implemented: on riscv64 a0 carries the return
-// value (not the syscall number, which stays in a7), so the saved
-// register file does not contain the original a0 argument needed for
-// a correct restart.  The kernel's own restart fixup also sets a7 to
-// __NR_restart_syscall for ERESTART_RESTARTBLOCK rather than re-running
-// the original number.  Both facts make a correct rearm from the
-// ptrace-captured register file alone infeasible; restore on riscv64
-// will therefore restart any interrupted syscall with a zero return
-// value (harmless for most calls) rather than with corrupted arguments.
+/// riscv64 re-arm is deliberately not implemented (see `restart_sentinel_in_a0`):
+/// a correct restart needs the original `a0` argument, which ptrace does not
+/// expose. On kernels ≥ 6.6 the kernel has already applied the restart fixup
+/// before the ptrace stop, so `a0` is the original argument and this check is a
+/// no-op. On older kernels the sentinel is visible here, and rejecting is the
+/// only safe answer — resuming would hand userspace a raw `-ERESTART*` as the
+/// syscall result.
+#[cfg(target_arch = "riscv64")]
+fn rearm_restartable_syscall(regs: &mut [u64]) -> Result<(), String> {
+    if let Some(sentinel) = restart_sentinel_in_a0(regs) {
+        return Err(format!(
+            "checkpoint captured an interrupted restartable syscall \
+             (a0 = {sentinel}); riscv64 cannot recover its original argument, \
+             so restore would resume with a corrupt return value. Retry the \
+             checkpoint while the workload is not blocked in a syscall"
+        ));
+    }
+    Ok(())
+}
 
 /// Build the FP image the stub points the signal frame's `fpstate` at.
 ///
@@ -480,8 +516,10 @@ fn build_fpstate_image(_fpregs: &[u8]) -> Vec<u8> {
     Vec::new()
 }
 
-#[cfg(not(target_arch = "x86_64"))]
-fn rearm_restartable_syscall(_regs: &mut [u64]) {}
+#[cfg(not(any(target_arch = "x86_64", target_arch = "riscv64")))]
+fn rearm_restartable_syscall(_regs: &mut [u64]) -> Result<(), String> {
+    Ok(())
+}
 
 /// Interns NUL-terminated strings into the blob's string table, deduplicating
 /// repeats (a multi-segment ELF mapping names the same file once per segment).
@@ -537,7 +575,7 @@ pub(crate) fn plan(
     let vdso = plan_vdso_moves(&ps.memory_maps);
 
     let mut regs = ps.regs.clone();
-    rearm_restartable_syscall(&mut regs);
+    rearm_restartable_syscall(&mut regs)?;
     let fpstate = build_fpstate_image(&ps.fpregs);
 
     let mut strings = StringTable::default();
@@ -628,6 +666,35 @@ mod tests {
 
     fn map(start: u64, end: u64, path: Option<&str>) -> MemoryMap {
         MemoryMap { start, end, perms: "rw-p".into(), offset: 0, path: path.map(Into::into) }
+    }
+
+    #[test]
+    fn restart_sentinel_matches_only_restart_codes() {
+        assert!(is_restart_sentinel(-512)); // ERESTARTSYS
+        assert!(is_restart_sentinel(-513)); // ERESTARTNOINTR
+        assert!(is_restart_sentinel(-514)); // ERESTARTNOHAND
+        assert!(is_restart_sentinel(-516)); // ERESTART_RESTARTBLOCK
+        assert!(!is_restart_sentinel(-515)); // ENOIOCTLCMD, not a restart code
+        assert!(!is_restart_sentinel(0));
+        assert!(!is_restart_sentinel(-1)); // EPERM
+    }
+
+    #[test]
+    #[cfg(target_arch = "riscv64")]
+    fn riscv64_rearm_rejects_an_in_flight_restartable_syscall() {
+        // riscv64 user_regs_struct order: a0 is index 10.
+        let mut regs = vec![0u64; 32];
+
+        regs[10] = (-514i64) as u64; // ERESTARTNOHAND
+        let err = rearm_restartable_syscall(&mut regs)
+            .expect_err("a restart sentinel in a0 must be rejected");
+        assert!(err.contains("restartable"), "names the cause: {err}");
+
+        regs[10] = (-515i64) as u64; // ENOIOCTLCMD is not a restart code
+        rearm_restartable_syscall(&mut regs).expect("ENOIOCTLCMD must not be rejected");
+
+        regs[10] = 7; // ordinary return value
+        rearm_restartable_syscall(&mut regs).expect("a normal return value passes");
     }
 
     #[test]
@@ -896,7 +963,7 @@ mod tests {
         regs[10] = (-514i64) as u64; // rax
         regs[15] = 34;               // orig_rax
         regs[16] = 0x4010_0000;      // rip, just past the `syscall`
-        rearm_restartable_syscall(&mut regs);
+        rearm_restartable_syscall(&mut regs).unwrap();
         assert_eq!(regs[10], 34, "rax reloaded with the original syscall number");
         assert_eq!(regs[16], 0x4010_0000 - 2, "rip rewound onto the 2-byte syscall");
     }
@@ -909,14 +976,14 @@ mod tests {
         regs[10] = (-515i64) as u64;
         regs[15] = 34;
         regs[16] = 0x4010_0000;
-        rearm_restartable_syscall(&mut regs);
+        rearm_restartable_syscall(&mut regs).unwrap();
         assert_eq!(regs[10], (-515i64) as u64);
         assert_eq!(regs[16], 0x4010_0000);
     }
 
-    // riscv64 rearm is not implemented (see comment above), so these
-    // tests are omitted — the cfg(not(any(...))) no-op fallback handles
-    // both the sentinel and non-restart cases correctly.
+    // riscv64 has no re-arm to test: it rejects a restart sentinel instead (see
+    // `riscv64_rearm_rejects_an_in_flight_restartable_syscall` above), so only
+    // x86_64 exercises the rewind here.
 
     #[test]
     #[cfg(target_arch = "x86_64")]
